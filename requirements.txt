@@ -1,0 +1,7 @@
+onnxruntime
+openslide-python
+numpy
+opencv-python
+matplotlib
+Pillow
+argparse
