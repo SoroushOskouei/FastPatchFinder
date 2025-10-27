@@ -28,7 +28,7 @@ pip install -r requirements.txt
 Clone this repository:
 
 ```bash
-git clone https://github.com/yourusername/patch-finder-framework.git
+git clone https://github.com/SoroushOskouei/patch-finder-framework.git
 cd patch-finder-framework
 ```
 
