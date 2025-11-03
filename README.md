@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1083918411.svg)](https://doi.org/10.5281/zenodo.17516343)
+
 # FastPatchFinder
 Fast Patch Finder Framework for digital pathology Supporting Openslide and level input
 
