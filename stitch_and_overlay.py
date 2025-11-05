@@ -76,15 +76,15 @@ def draw_patches_with_filled_indices(slide_path, json_path, patch_size, level_L,
 
 
 
+## example use:
+# slide_path = 'sample_slide.svs' 
+# json_path = 'sample_slide.svs.json'
+# patch_size = 224 
 
-slide_path = '../Slides_test/TCGA-C8-A12P-01Z-00-DX1.670B5DE8-07B0-4E4C-93FA-FA3DFFCCE50D.svs' 
-json_path = '../output_224_lvl_2/patch_positions_TCGA-C8-A12P-01Z-00-DX1.670B5DE8-07B0-4E4C-93FA-FA3DFFCCE50D.svs.json'
-patch_size = 224 
+# level_L = 2
 
-level_L = 2
+# level_T = 3
 
-level_T = 3
+# fill_indices = [0, 3, 5, 10]  # highlight some specific patches
 
-fill_indices = [0, 3, 5, 10]  # highlight some specific patches
-
-draw_patches_with_filled_indices(slide_path, json_path, patch_size, level_L, level_T, fill_indices)
+# draw_patches_with_filled_indices(slide_path, json_path, patch_size, level_L, level_T, fill_indices)
