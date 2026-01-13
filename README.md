@@ -30,8 +30,8 @@ pip install -r requirements.txt
 Clone this repository:
 
 ```bash
-git clone https://github.com/SoroushOskouei/patch-finder-framework.git
-cd patch-finder-framework
+git clone https://github.com/SoroushOskouei/FastPatchFinder.git
+cd FastPatchFinder
 ```
 
 ## Run the framework using the following command:
