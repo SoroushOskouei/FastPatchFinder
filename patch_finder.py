@@ -153,7 +153,7 @@ def run_patch_finder_framework(slide_path, onnx_model_path, target_level, patch_
         # -------------------------------------------------------------
         # 2. SVD Stage: Get BBox and Crop
         # -------------------------------------------------------------
-        svd_bbox, cropped_thumb, debug_imgs = get_tissue_bbox_svd(thumb_np, n_vectors=5)
+        svd_bbox, cropped_thumb, debug_imgs = get_tissue_bbox_svd(thumb_np, n_vectors=15)
         
         # Visualize SVD
         svd_viz_path = os.path.join(slide_output_dir, "svd_steps.png")
