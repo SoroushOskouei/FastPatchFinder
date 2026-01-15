@@ -19,6 +19,10 @@ This framework is designed to find patches in whole slide images (WSIs) using ti
   - `Pillow`
   - `argparse`
 
+ **NOTE** 
+For the old version use the model best_unet.onnx with patch_finder_oldversion.py.
+For the newest version use [this](https://drive.google.com/file/d/1QbNJO1xguLNlClEuz1K1OVLk3bSu6X9D/view?usp=drive_link) model with patch_finder.py.
+
 You can install the dependencies using the following command:
 
 ```bash
