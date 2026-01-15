@@ -14,11 +14,12 @@ import matplotlib.patches as mpatches
 # 1. SVD & Bounding Box Logic (Pure Numpy/CPU)                    #
 ###################################################################
 
-def get_tissue_bbox_svd(thumbnail_rgb, n_vectors=5, threshold=215):
+def get_tissue_bbox_svd(thumbnail_rgb, n_vectors=5, threshold=215, min_threshold=25):
     """
     1. Converts thumbnail to grayscale.
     2. Performs SVD and reconstructs using only the top `n_vectors`.
     3. Thresholds to find approximate tissue location.
+       - Uses a range [min_threshold, threshold] to exclude black frames.
     4. Computes a bounding box (x_min, y_min, x_max, y_max).
     Returns: bbox, cropped_thumb, debug_images(tuple)
     """
@@ -40,8 +41,10 @@ def get_tissue_bbox_svd(thumbnail_rgb, n_vectors=5, threshold=215):
     reconstructed = np.dot(U[:, :k] * s[:k], Vt[:k, :])
 
     # 4. Threshold to create a mask 
-    # (Background is usually bright > threshold, Tissue is dark)
-    svd_mask = (reconstructed < threshold)
+    # Background is usually bright (> threshold)
+    # Black Frame/Artifacts are very dark (< min_threshold)
+    # Tissue is in between
+    svd_mask = (reconstructed < threshold) & (reconstructed > min_threshold)
 
     # 5. Find Bounding Box
     rows = np.any(svd_mask, axis=1)
@@ -49,7 +52,7 @@ def get_tissue_bbox_svd(thumbnail_rgb, n_vectors=5, threshold=215):
 
     # Handle case where no tissue is detected (return full image)
     if not np.any(rows) or not np.any(cols):
-        print("  Warning: SVD found no tissue. Using full thumbnail.")
+        print("  Warning: SVD found no tissue within valid intensity range. Using full thumbnail.")
         return (0, 0, thumbnail.shape[1], thumbnail.shape[0]), thumbnail, (reconstructed, svd_mask)
 
     y_min, y_max = np.where(rows)[0][[0, -1]]
@@ -76,14 +79,14 @@ def visualize_svd_steps(original, reconstructed, mask, bbox, output_path):
 
     # Plot 1: SVD Reconstruction
     axes[0].imshow(reconstructed, cmap='gray')
-    axes[0].set_title("1. SVD Reconstruction (Top 5 Vecs)")
+    axes[0].set_title("1. SVD Reconstruction")
     axes[0].axis('off')
 
     # Plot 2: Thresholded Mask
     axes[1].imshow(mask, cmap='gray')
     rect = mpatches.Rectangle((x_min, y_min), box_w, box_h, linewidth=2, edgecolor='red', facecolor='none')
     axes[1].add_patch(rect)
-    axes[1].set_title("2. SVD Mask + Bounding Box")
+    axes[1].set_title("2. SVD Mask (Range Filtered) + BBox")
     axes[1].axis('off')
 
     # Plot 3: Original Thumbnail
@@ -102,28 +105,50 @@ def visualize_svd_steps(original, reconstructed, mask, bbox, output_path):
 # 2. ONNX Inference                                               #
 ###################################################################
 
-def predict_mask_on_thumbnail(thumbnail, onnx_model, model_input_size=500, threshold=0.6):
+def predict_mask_on_thumbnail(thumbnail, onnx_sess, model_input_size=500):
     """
-    Runs ONNX inference on the provided thumbnail (or crop).
+    Args:
+        thumbnail: Numpy array (H, W, 3) in RGB, values 0-255.
+        onnx_sess: The loaded ONNX Runtime InferenceSession.
     """
-    if not hasattr(predict_mask_on_thumbnail, "sess"):
-        print(f"  Initializing ONNX session for: {onnx_model}")
-        # Prioritize CUDA if available, else CPU
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        predict_mask_on_thumbnail.sess = ort.InferenceSession(onnx_model, providers=providers)
+    # 1. Resize to (500, 500)
+    img_resized = cv2.resize(thumbnail, (model_input_size, model_input_size), interpolation=cv2.INTER_LINEAR)
     
-    # Resize to model input
-    inp = cv2.resize(thumbnail, (model_input_size, model_input_size)).astype(np.float32) / 255.0
-    inp = np.expand_dims(inp, 0)
+    # 2. Cast to Float32
+    img_float = img_resized.astype(np.float32)
+
+    # 3. Manual ResNet Preprocessing
+    # Convert RGB -> BGR
+    img_bgr = img_float[..., ::-1] 
+
+    # Subtract ImageNet Mean (BGR order)
+    # CRITICAL FIX: Ensure mean is float32 so the result stays float32
+    mean = np.array([103.939, 116.779, 123.68], dtype=np.float32)
+    
+    img_preprocessed = img_bgr - mean
+
+    # 4. Expand Dimensions (Batch Size) -> (1, 500, 500, 3)
+    inp = np.expand_dims(img_preprocessed, axis=0)
+
+    # EXTRA SAFETY: Ensure final input is strictly float32
+    inp = inp.astype(np.float32)
+
+    # 5. Run ONNX Inference
+    input_name = onnx_sess.get_inputs()[0].name
     
     # Run inference
-    # Note: Adjust output indexing [0][0, ..., 0] based on your specific ONNX model output shape
-    pred = predict_mask_on_thumbnail.sess.run(None, {"input": inp})[0][0, ..., 0]
+    pred = onnx_sess.run(None, {input_name: inp})[0] 
     
-    # Resize output mask back to input image size
-    pred = cv2.resize(pred, (thumbnail.shape[1], thumbnail.shape[0]), interpolation=cv2.INTER_LINEAR)
-    
-    return (pred > threshold).astype(np.uint8)
+    # Squeeze batch dimension
+    pred = np.squeeze(pred)
+
+    # 6. Resize Mask back to original thumbnail dimensions
+    orig_h, orig_w = thumbnail.shape[:2]
+    pred_mask = cv2.resize(pred, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+
+    # 7. Threshold
+    # Using 0.5 as per the integrated snippet
+    return (pred_mask > 0.5).astype(np.uint8)
 
 
 ###################################################################
@@ -153,7 +178,13 @@ def run_patch_finder_framework(slide_path, onnx_model_path, target_level, patch_
         # -------------------------------------------------------------
         # 2. SVD Stage: Get BBox and Crop
         # -------------------------------------------------------------
-        svd_bbox, cropped_thumb, debug_imgs = get_tissue_bbox_svd(thumb_np, n_vectors=15)
+        # NOTE: Added min_threshold=25 to avoid picking up the black border
+        svd_bbox, cropped_thumb, debug_imgs = get_tissue_bbox_svd(
+            thumb_np, 
+            n_vectors=15, 
+            threshold=215, 
+            min_threshold=25
+        )
         
         # Visualize SVD
         svd_viz_path = os.path.join(slide_output_dir, "svd_steps.png")
@@ -162,8 +193,14 @@ def run_patch_finder_framework(slide_path, onnx_model_path, target_level, patch_
         # -------------------------------------------------------------
         # 3. ONNX Inference (Run ONLY on the Crop)
         # -------------------------------------------------------------
+        
+        # Initialize session here to pass to the prediction function
+        print(f"  Loading ONNX model from: {onnx_model_path}")
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        sess = ort.InferenceSession(onnx_model_path, providers=providers)
+
         # crop_mask corresponds to the cropped_thumb area
-        crop_mask = predict_mask_on_thumbnail(cropped_thumb, onnx_model_path) 
+        crop_mask = predict_mask_on_thumbnail(cropped_thumb, sess) 
         
         if np.sum(crop_mask) == 0:
             print("  Warning: Model produced an empty mask on the crop. No patches will be found.")
@@ -176,7 +213,7 @@ def run_patch_finder_framework(slide_path, onnx_model_path, target_level, patch_
         
         # Calculate patch size in thumbnail scale
         # Ratio: how many target_level pixels equal 1 thumbnail pixel?
-        # Actually we need: how big is 'patch_size_l' in thumbnail pixels?
+        # actually we need: how big is 'patch_size_l' in thumbnail pixels?
         # w_th / w_l is the scaling factor < 1
         ps_th_w = int(patch_size_l * (w_th / w_l))
         ps_th_h = int(patch_size_l * (h_th / h_l))
@@ -287,7 +324,7 @@ def main():
     found_svs_files = False
     for root, _, files in os.walk(args.slides_dir):
         for filename in files:
-            if filename.endswith('.svs'):
+            if filename.endswith('.mrxs'):
                 found_svs_files = True
                 file_path = os.path.join(root, filename)
                 run_patch_finder_framework(
@@ -299,7 +336,7 @@ def main():
                 )
         
     if not found_svs_files:
-        print("No .svs files were found in the specified directory.")
+        print("No .mrxs files were found in the specified directory.")
 
 if __name__ == "__main__":
     main()
