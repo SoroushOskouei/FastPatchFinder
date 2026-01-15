@@ -44,8 +44,3 @@ cd FastPatchFinder
 ```bash
 python patch_finder.py --slides_dir <path_to_slide_directory> --onnx_model <path_to_onnx_model> --target_level <target_level> --patch_size <patch_size> --output_dir <output_directory>
 ```
-
-## Example:
-```bash
-python patch_finder.py --slides_dir ./slides --onnx_model ./best_unet.onnx --target_level 3 --patch_size 225 --output_dir ./output
-```
