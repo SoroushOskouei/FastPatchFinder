@@ -155,7 +155,7 @@ def predict_mask_on_thumbnail(thumbnail, onnx_sess, model_input_size=500):
 # 3. Main Patch Finder Framework                                  #
 ###################################################################
 
-def run_patch_finder_framework(slide_path, onnx_model_path, target_level, patch_size_l, tissue_thresh=0.5, output_dir='./output'):
+def run_patch_finder_framework(slide_path, onnx_model_path, target_level, patch_size_l, tissue_thresh=0.3, output_dir='./output'):
     print(f"--- Running Patch Finder on: {os.path.basename(slide_path)} ---")
     
     try:
@@ -171,135 +171,154 @@ def run_patch_finder_framework(slide_path, onnx_model_path, target_level, patch_
         thumb_image_pil = slide.read_region((0, 0), th_level, (w_th, h_th)).convert("RGB")
         thumb_np = np.array(thumb_image_pil)
         
-        # Create output directory for this slide
         slide_output_dir = os.path.join(output_dir, os.path.splitext(os.path.basename(slide_path))[0])
         os.makedirs(slide_output_dir, exist_ok=True)
 
         # -------------------------------------------------------------
-        # 2. SVD Stage: Get BBox and Crop
+        # 1. Calculate Patch Size
         # -------------------------------------------------------------
-        # NOTE: Added min_threshold=25 to avoid picking up the black border
-        svd_bbox, cropped_thumb, debug_imgs = get_tissue_bbox_svd(
-            thumb_np, 
-            n_vectors=15, 
-            threshold=215, 
-            min_threshold=25
-        )
-        
-        # Visualize SVD
-        svd_viz_path = os.path.join(slide_output_dir, "svd_steps.png")
-        visualize_svd_steps(thumb_np, debug_imgs[0], debug_imgs[1], svd_bbox, svd_viz_path)
+        ps_th_w = int(patch_size_l * (w_th / w_l))
+        ps_th_h = int(patch_size_l * (h_th / h_l))
+
+        if ps_th_w == 0 or ps_th_h == 0:
+            print(f"  Error: Calculated thumbnail patch size is zero. Skipping.")
+            slide.close()
+            return
 
         # -------------------------------------------------------------
-        # 3. ONNX Inference (Run ONLY on the Crop)
+        # 2. SVD Stage: Get "Tight" BBox
         # -------------------------------------------------------------
+        svd_bbox_tight, _, debug_imgs = get_tissue_bbox_svd(
+            thumb_np, n_vectors=15, threshold=215, min_threshold=25
+        )
+        t_x1, t_y1, t_x2, t_y2 = svd_bbox_tight
         
-        # Initialize session here to pass to the prediction function
+        # -------------------------------------------------------------
+        # 3. Create "Inference Crop" with Padding
+        # -------------------------------------------------------------
+        # We pad by a FULL patch size to be safe, ensuring we have pixels 
+        # for patches that stick out significantly.
+        pad_x = ps_th_w
+        pad_y = ps_th_h
+
+        # Clamp to image boundaries
+        p_x1 = max(0, t_x1 - pad_x)
+        p_y1 = max(0, t_y1 - pad_y)
+        p_x2 = min(w_th, t_x2 + pad_x)
+        p_y2 = min(h_th, t_y2 + pad_y)
+
+        cropped_thumb_padded = thumb_np[p_y1 : p_y2, p_x1 : p_x2, :]
+        print(f"  SVD Box: {svd_bbox_tight} -> Inference Crop: {(p_x1, p_y1, p_x2, p_y2)}")
+
+        # -------------------------------------------------------------
+        # 4. ONNX Inference
+        # -------------------------------------------------------------
         print(f"  Loading ONNX model from: {onnx_model_path}")
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         sess = ort.InferenceSession(onnx_model_path, providers=providers)
 
-        # crop_mask corresponds to the cropped_thumb area
-        crop_mask = predict_mask_on_thumbnail(cropped_thumb, sess) 
+        # Mask corresponds to the PADDED area
+        crop_mask = predict_mask_on_thumbnail(cropped_thumb_padded, sess) 
         
         if np.sum(crop_mask) == 0:
-            print("  Warning: Model produced an empty mask on the crop. No patches will be found.")
+            print("  Warning: Model produced an empty mask.")
             slide.close()
             return
 
         # -------------------------------------------------------------
-        # 4. Generate Patches (Mapping back to Global coords)
+        # 5. Generate Patches (Center-Logic Corrected)
         # -------------------------------------------------------------
-        
-        # Calculate patch size in thumbnail scale
-        # Ratio: how many target_level pixels equal 1 thumbnail pixel?
-        # actually we need: how big is 'patch_size_l' in thumbnail pixels?
-        # w_th / w_l is the scaling factor < 1
-        ps_th_w = int(patch_size_l * (w_th / w_l))
-        ps_th_h = int(patch_size_l * (h_th / h_l))
-        
-        if ps_th_w == 0 or ps_th_h == 0:
-            print(f"  Error: Calculated thumbnail patch size is zero. ({ps_th_w}, {ps_th_h}). Skipping.")
-            slide.close()
-            return
-
         patch_positions = []
-        valid_patch_coords_th = [] # Global thumbnail coords for plotting
+        valid_patch_coords_th = [] 
 
-        # Unpack SVD bbox offset
-        x_min_offset, y_min_offset = svd_bbox[0], svd_bbox[1]
+        # We want our grid to align with the ORIGINAL SVD Box (t_x1, t_y1)
+        # to prevent "phase shifting" the patches.
         
-        # Iterate over the CROP dimensions
+        # Start the loop relative to the Padded Crop (0,0), 
+        # but align the first step to match t_x1.
+        
+        # Offset of the Tight Box relative to the Padded Crop
+        offset_x = t_x1 - p_x1
+        offset_y = t_y1 - p_y1
+
+        # Determine start/end for the grid relative to the Tight Box
+        # We start slightly before 0 (negative relative to tight box) if the padding allows
+        # But per your logic: Center must be inside.
+        # If x = t_x1 - ps, Center = t_x1 - ps/2 (Outside). 
+        # So generally, we can start exactly at offset_x.
+        
         crop_h, crop_w = crop_mask.shape
         
-        for x_crop in range(0, crop_w - ps_th_w, ps_th_w):
-            for y_crop in range(0, crop_h - ps_th_h, ps_th_h):
+        # Grid loop: We iterate coordinate 'x' representing the top-left of a patch
+        # relative to the PADDED crop.
+        # We start at 'offset_x' (which aligns with t_x1) and go up to the crop limit.
+        for x_crop in range(offset_x, crop_w - ps_th_w + 1, ps_th_w):
+            for y_crop in range(offset_y, crop_h - ps_th_h + 1, ps_th_h):
                 
-                # Check tissue ratio on the crop mask
-                mask_patch = crop_mask[y_crop : y_crop + ps_th_h, x_crop : x_crop + ps_th_w]
-                tissue_ratio = np.sum(mask_patch) / (ps_th_w * ps_th_h)
+                # --- CHECK 1: CENTER LOGIC ---
+                # Calculate the center of this patch in Global Coords
+                x_global = p_x1 + x_crop
+                y_global = p_y1 + y_crop
                 
-                if tissue_ratio > tissue_thresh:
-                    # 1. Calculate Global Thumbnail Coords
-                    x_global_th = x_crop + x_min_offset
-                    y_global_th = y_crop + y_min_offset
+                center_x = x_global + ps_th_w / 2
+                center_y = y_global + ps_th_h / 2
+                
+                # Is the center inside the TIGHT SVD box?
+                center_in_x = (t_x1 <= center_x <= t_x2)
+                center_in_y = (t_y1 <= center_y <= t_y2)
+                
+                if center_in_x and center_in_y:
                     
-                    valid_patch_coords_th.append((x_global_th, y_global_th))
+                    # --- CHECK 2: TISSUE THRESHOLD ---
+                    mask_patch = crop_mask[y_crop : y_crop + ps_th_h, x_crop : x_crop + ps_th_w]
+                    tissue_ratio = np.sum(mask_patch) / (ps_th_w * ps_th_h)
                     
-                    # 2. Calculate Level 0 Coords (for JSON output)
-                    # We map from global thumbnail to level 0
-                    x_0 = int(x_global_th * (w_0 / w_th))
-                    y_0 = int(y_global_th * (h_0 / h_th))
-                    
-                    # Store as standard python types
-                    patch_positions.append({'x': int(x_0), 'y': int(y_0)})
+                    # NOTE: Edge patches have lots of empty space. 
+                    # If tissue_ratio is low but center is inside, you might want to keep it.
+                    # Current logic: Strict threshold.
+                    if tissue_ratio > tissue_thresh:
+                        
+                        valid_patch_coords_th.append((x_global, y_global))
+                        
+                        x_0 = int(x_global * (w_0 / w_th))
+                        y_0 = int(y_global * (h_0 / h_th))
+                        patch_positions.append({'x': int(x_0), 'y': int(y_0)})
 
         print(f"  Found {len(patch_positions)} valid patches.")
-        if not patch_positions:
-            slide.close()
-            return
 
         # -------------------------------------------------------------
-        # 5. Final Visualization (Full Thumbnail + SVD Box + Patches)
+        # 6. Visualization
         # -------------------------------------------------------------
         fig, ax = plt.subplots(figsize=(10, 10))
         ax.imshow(thumb_image_pil)
         
-        # Draw SVD Box
-        svd_rect = mpatches.Rectangle(
-            (svd_bbox[0], svd_bbox[1]), 
-            svd_bbox[2] - svd_bbox[0], 
-            svd_bbox[3] - svd_bbox[1],
-            fill=False, edgecolor='blue', linewidth=2, label="SVD Crop"
-        )
+        # Draw SVD Tight Box (Blue)
+        svd_rect = mpatches.Rectangle((t_x1, t_y1), t_x2 - t_x1, t_y2 - t_y1,
+            fill=False, edgecolor='blue', linewidth=2, label="SVD Limit (Center must be in here)")
         ax.add_patch(svd_rect)
 
-        # Draw Patch Boxes
+        # Draw Valid Patches (Red)
         for (x_th, y_th) in valid_patch_coords_th:
             rect = mpatches.Rectangle((x_th, y_th), ps_th_w, ps_th_h, fill=False, edgecolor='red', linewidth=1)
             ax.add_patch(rect)
 
-        ax.set_title("Thumbnail: SVD Crop (Blue) & Valid Patches (Red)")
+        ax.set_title(f"Patches (Center-in-Box Logic) | Thresh: {tissue_thresh}")
         ax.legend()
         ax.axis('off')
 
         plot_filename = os.path.join(slide_output_dir, "final_patches_viz.png")
         plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
-        print(f"  Saved grid plot to: {plot_filename}")
         plt.close(fig)
 
         # Save JSON
         json_filename = os.path.join(slide_output_dir, "patch_positions.json")
         with open(json_filename, 'w') as f:
             json.dump(patch_positions, f, indent=4)
-        print(f"  Saved patch positions to: {json_filename}")
 
         slide.close()
         
-    except OpenSlideError as e:
-        print(f"  Error opening or reading slide: {e}")
     except Exception as e:
-        print(f"  An unexpected error occurred: {e}")
+        print(f"  Error: {e}")
         import traceback
         traceback.print_exc()
 
